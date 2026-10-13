@@ -100,4 +100,4 @@ private:
 	int m_last_space;
 };
 
-#endif // VPXDECODER_H
+#endif // VPX_DECODER_H
