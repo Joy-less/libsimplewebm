@@ -76,11 +76,6 @@ public:
 		return (bool)m_alphaCtx;
 	}
 
-	inline int getFramesDelay() const
-	{
-		return m_delay;
-	}
-
 	bool decode(const WebMFrame &frame);
 
 	// The image data is not copied. Only 8-bit planar images are supported.
@@ -94,9 +89,8 @@ private:
 	const void *m_iter;
 	const void *m_alphaIter;
 
-	unsigned m_threads;
+	unsigned int m_threads;
 
-	int m_delay;
 	int m_last_space;
 };
 
