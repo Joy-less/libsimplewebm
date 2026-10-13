@@ -59,13 +59,17 @@ VPXDecoder::VPXDecoder(const WebMDemuxer &demuxer, unsigned int threads) :
 
 	switch (demuxer.getVideoCodec())
 	{
+#ifndef LIB_SIMPLE_WEBM_DISABLE_VP8
 		case WebMDemuxer::VIDEO_VP8:
 			codecIface = vpx_codec_vp8_dx();
 			break;
+#endif
 
+#ifndef LIB_SIMPLE_WEBM_DISABLE_VP9
 		case WebMDemuxer::VIDEO_VP9:
 			codecIface = vpx_codec_vp9_dx();
 			break;
+#endif
 
 		default:
 			return;
