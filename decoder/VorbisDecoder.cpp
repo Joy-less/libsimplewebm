@@ -61,7 +61,11 @@ bool VorbisDecoder::getPCMS16(const WebMFrame &frame, short *buffer, int &numOut
 {
 	numOutSamples = 0;
 
-	if (!m_decoder || !buffer || frame.bufferSize <= 0)
+	if (!m_decoder || !buffer || !frame.buffer || frame.bufferSize <= 0 || m_channels <= 0)
+		return false;
+
+	const int maxSamples = getBufferSamples();
+	if (maxSamples <= 0)
 		return false;
 
 	m_decoder->packet.packet = frame.buffer;
@@ -73,19 +77,22 @@ bool VorbisDecoder::getPCMS16(const WebMFrame &frame, short *buffer, int &numOut
 	if (vorbis_synthesis_blockin(&m_decoder->dspState, &m_decoder->block))
 		return false;
 
-	const int maxSamples = getBufferSamples();
-
-	int samplesCount;
 	int count = 0;
+	int samplesCount;
 	float **pcm;
 
 	while ((samplesCount = vorbis_synthesis_pcmout(&m_decoder->dspState, &pcm)) > 0)
 	{
-		const int toConvert = samplesCount <= maxSamples ? samplesCount : maxSamples;
+		// Never write more than maxSamples per channel per call
+		const int remaining = maxSamples - count;
+		if (remaining <= 0)
+			break;
+
+		const int toConvert = samplesCount < remaining ? samplesCount : remaining;
 
 		for (int c = 0; c < m_channels; ++c)
 		{
-			float *samples = pcm[c];
+			const float *samples = pcm[c];
 
 			for (int i = 0, j = c; i < toConvert; ++i, j += m_channels)
 			{
@@ -96,11 +103,64 @@ bool VorbisDecoder::getPCMS16(const WebMFrame &frame, short *buffer, int &numOut
 				else if (sample < -32768)
 					sample = -32768;
 
-				buffer[count + j] = static_cast<short>(sample);
+				buffer[(count * m_channels) + j] = static_cast<short>(sample);
 			}
 		}
 
-		vorbis_synthesis_read(&m_decoder->dspState, toConvert);
+		if (vorbis_synthesis_read(&m_decoder->dspState, toConvert))
+			return false;
+
+		count += toConvert;
+	}
+
+	numOutSamples = count;
+	return true;
+}
+
+bool VorbisDecoder::getPCMF(const WebMFrame &frame, float *buffer, int &numOutSamples)
+{
+	numOutSamples = 0;
+
+	if (!m_decoder || !buffer || !frame.buffer || frame.bufferSize <= 0 || m_channels <= 0)
+		return false;
+
+	const int maxSamples = getBufferSamples();
+	if (maxSamples <= 0)
+		return false;
+
+	m_decoder->packet.packet = frame.buffer;
+	m_decoder->packet.bytes = frame.bufferSize;
+
+	if (vorbis_synthesis(&m_decoder->block, &m_decoder->packet))
+		return false;
+
+	if (vorbis_synthesis_blockin(&m_decoder->dspState, &m_decoder->block))
+		return false;
+
+	int count = 0;
+	int samplesCount;
+	float **pcm;
+
+	while ((samplesCount = vorbis_synthesis_pcmout(&m_decoder->dspState, &pcm)) > 0)
+	{
+		// Never write more than maxSamples per channel per call
+		const int remaining = maxSamples - count;
+		if (remaining <= 0)
+			break;
+
+		const int toConvert = samplesCount < remaining ? samplesCount : remaining;
+
+		for (int c = 0; c < m_channels; ++c)
+		{
+			const float *samples = pcm[c];
+
+			for (int i = 0, j = c; i < toConvert; ++i, j += m_channels)
+				buffer[(count * m_channels) + j] = samples[i];
+		}
+
+		if (vorbis_synthesis_read(&m_decoder->dspState, toConvert))
+			return false;
+
 		count += toConvert;
 	}
 
