@@ -31,6 +31,7 @@
 #include <webm/file_reader.h>
 
 #include <cstdio>
+#include <limits>
 #include <memory>
 
 int main(int argc, char *argv[])
@@ -104,6 +105,7 @@ int main(int argc, char *argv[])
 	const bool audioDecoderOpen = (vorbisDec && vorbisDec->isOpen()) || (opusDec && opusDec->isOpen());
 
 	std::unique_ptr<short[]> pcm;
+	int pcmCapacity = 0;
 
 	if (audioDecoderOpen)
 	{
@@ -120,9 +122,16 @@ int main(int argc, char *argv[])
 			bufferSamples = opusDec->getBufferSamples();
 		}
 
-		if (channels > 0 && bufferSamples > 0)
+		if (channels > 0 && bufferSamples > 0 && bufferSamples <= std::numeric_limits<int>::max() / channels)
 		{
-			pcm.reset(new short[bufferSamples * channels]);
+			pcmCapacity = bufferSamples * channels;
+			pcm.reset(new short[pcmCapacity]);
+		}
+
+		if (!pcm)
+		{
+			std::fprintf(stderr, "Failed to allocate audio PCM buffer\n");
+			return 1;
 		}
 	}
 
@@ -149,7 +158,6 @@ int main(int argc, char *argv[])
 			while (videoDec.getImage(image) == VPXDecoder::NO_ERROR)
 			{
 				++decodedImages;
-
 				hasAlpha |= image.alpha != nullptr;
 			}
 		}
@@ -161,11 +169,11 @@ int main(int argc, char *argv[])
 
 			if (vorbisDec && vorbisDec->isOpen())
 			{
-				decoded = vorbisDec->getPCMS16(audioFrame, pcm.get(), numOutSamples);
+				decoded = vorbisDec->getPCMS16(audioFrame, pcm.get(), pcmCapacity, numOutSamples);
 			}
 			else if (opusDec && opusDec->isOpen())
 			{
-				decoded = opusDec->getPCMS16(audioFrame, pcm.get(), numOutSamples);
+				decoded = opusDec->getPCMS16(audioFrame, pcm.get(), pcmCapacity, numOutSamples);
 			}
 
 			if (!decoded)
