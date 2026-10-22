@@ -32,6 +32,7 @@
 #include <webm/file_reader.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -185,6 +186,11 @@ int main(int argc, char **argv)
     double audioDrainWallTime = 0.0;
     double playbackStart = SDL_GetTicks() / 1000.0;
 
+    double playbackBaseTime = 0.0;
+    double discardVideoBefore = 0.0;
+    double discardAudioBefore = 0.0;
+    double currentPlaybackTime = 0.0;
+
     unsigned long long submittedSamples = 0;
 
     WebMFrame videoFrame;
@@ -214,12 +220,94 @@ int main(int argc, char **argv)
         }
     }
 
+    auto seekTo = [&](double requestedTime) -> bool {
+        if (!std::isfinite(requestedTime))
+            return false;
+
+        requestedTime = std::max(0.0, requestedTime);
+
+        const double duration = demuxer.getLength();
+
+        if (duration > 0.0)
+            requestedTime = std::min(requestedTime, duration);
+
+        // Position the demuxer at a keyframe so the video decoder can rebuild its state from a valid starting point.
+        const double keyframeTime = demuxer.seek(requestedTime);
+
+        if (keyframeTime < 0.0) {
+            std::fprintf(stderr, "Failed to seek to %.3f seconds.\n", requestedTime);
+            return false;
+        }
+
+        if (!videoDecoder.reset()) {
+            std::fprintf(stderr, "Failed to reset the video decoder.\n");
+            return false;
+        }
+
+        if (opusDecoder && !opusDecoder->reset()) {
+            std::fprintf(stderr, "Failed to reset the Opus decoder.\n");
+            return false;
+        }
+
+        if (vorbisDecoder && !vorbisDecoder->reset()) {
+            std::fprintf(stderr, "Failed to reset the Vorbis decoder.\n");
+            return false;
+        }
+
+        if (audioStream) {
+            if (!SDL_PauseAudioStreamDevice(audioStream)) {
+                std::fprintf(stderr, "Failed to pause audio: %s\n", SDL_GetError());
+                return false;
+            }
+
+            if (!SDL_ClearAudioStream(audioStream)) {
+                std::fprintf(stderr, "Failed to clear audio: %s\n", SDL_GetError());
+                return false;
+            }
+        }
+
+        videoQueue.clear();
+
+        demuxerEOF = false;
+        audioStarted = false;
+        audioDrainStarted = false;
+        audioDrainWallTime = 0.0;
+        submittedSamples = 0;
+
+        playbackBaseTime = requestedTime;
+        discardVideoBefore = requestedTime;
+        discardAudioBefore = requestedTime;
+
+        const double now = SDL_GetTicks() / 1000.0;
+        playbackStart = now - requestedTime;
+        currentPlaybackTime = requestedTime;
+
+        return true;
+    };
+
     while (running) {
         SDL_Event event;
 
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT)
+            if (event.type == SDL_EVENT_QUIT) {
                 running = false;
+            } else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+                double targetTime = currentPlaybackTime;
+
+                if (event.key.key == SDLK_LEFT) {
+                    targetTime = std::max(0.0, targetTime - 5.0);
+                } else if (event.key.key == SDLK_RIGHT) {
+                    targetTime += 5.0;
+                } else {
+                    continue;
+                }
+
+                if (!seekTo(targetTime)) {
+                    success = false;
+                    running = false;
+                    break;
+                }
+            }
         }
 
         if (!running)
@@ -243,24 +331,24 @@ int main(int argc, char **argv)
 
         if (hasAudio) {
             if (!audioStarted) {
-                // Don't let video run ahead before audio playback begins
-                playbackTime = 0.0;
-            } else {
-                const double audioClock = static_cast<double>(submittedSamples) / sampleRate - static_cast<double>(queuedBytes) / bytesPerSecond;
+            // Keep video at the seek position until audio playback begins.
+            playbackTime = playbackBaseTime;
+        } else {
+            const double audioClock = playbackBaseTime + static_cast<double>(submittedSamples) / sampleRate - static_cast<double>(queuedBytes) / bytesPerSecond;
 
-                playbackTime = std::max(0.0, audioClock);
+            playbackTime = std::max(playbackBaseTime, audioClock);
 
-                if (demuxerEOF && queuedBytes == 0) {
-                    if (!audioDrainStarted) {
-                        audioDrainStarted = true;
-                        audioDrainWallTime = now;
-                    }
-
-                    // Keep the clock advancing after the final queued samples have left SDL's stream queue
-                    playbackTime = static_cast<double>(submittedSamples) / sampleRate + (now - audioDrainWallTime);
+            if (demuxerEOF && queuedBytes == 0) {
+                if (!audioDrainStarted) {
+                    audioDrainStarted = true;
+                    audioDrainWallTime = now;
                 }
+
+                // Continue advancing the clock after the audio queue drains.
+                playbackTime = playbackBaseTime + static_cast<double>(submittedSamples) / sampleRate + (now - audioDrainWallTime);
             }
         }
+    }
 
         // Read ahead to keep audio fed, but don't decode an entire silent video into memory when there is no audio track
         bool shouldReadMore = !demuxerEOF;
@@ -312,7 +400,8 @@ int main(int argc, char **argv)
                             continue;
                         }
 
-                        videoQueue.push_back(std::move(decoded));
+                        if (decoded.time >= discardVideoBefore)
+                            videoQueue.push_back(std::move(decoded));
                     } else if (imageError != VPXDecoder::NO_FRAME) {
                         std::fprintf(stderr, "Failed to decode video frame.\n");
                         success = false;
@@ -333,11 +422,10 @@ int main(int argc, char **argv)
                         continue;
                     }
 
-                    if (numOutSamples > 0) {
+                    if (numOutSamples > 0 && audioFrame.time >= discardAudioBefore) {
                         const size_t sampleCount = static_cast<size_t>(numOutSamples) * channels;
 
-                        if (sampleCount >
-                            std::numeric_limits<size_t>::max() / sizeof(short)) {
+                        if (sampleCount > std::numeric_limits<size_t>::max() / sizeof(short)) {
                             std::fprintf(stderr, "Audio packet size overflow.\n");
                             success = false;
                             running = false;
@@ -346,8 +434,7 @@ int main(int argc, char **argv)
 
                         const size_t pcmBytes = sampleCount * sizeof(short);
 
-                        if (pcmBytes >
-                            static_cast<size_t>(std::numeric_limits<int>::max())) {
+                        if (pcmBytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
                             std::fprintf(stderr, "Audio packet is too large.\n");
                             success = false;
                             running = false;
@@ -393,7 +480,7 @@ int main(int argc, char **argv)
                 break;
             }
 
-            playbackTime = std::max(0.0, static_cast<double>(submittedSamples) / sampleRate - static_cast<double>(queuedBytes) / bytesPerSecond);
+            playbackTime = std::max(playbackBaseTime, playbackBaseTime + static_cast<double>(submittedSamples) / sampleRate - static_cast<double>(queuedBytes) / bytesPerSecond);
 
             if (demuxerEOF && queuedBytes == 0) {
                 if (!audioDrainStarted) {
@@ -401,18 +488,21 @@ int main(int argc, char **argv)
                     audioDrainWallTime = frameNow;
                 }
 
-                playbackTime = static_cast<double>(submittedSamples) / sampleRate + (frameNow - audioDrainWallTime);
+                playbackTime = playbackBaseTime + static_cast<double>(submittedSamples) / sampleRate + (frameNow - audioDrainWallTime);
             }
         } else if (!hasAudio) {
             playbackTime = frameNow - playbackStart;
         }
 
+        currentPlaybackTime = playbackTime;
+
         // Present every frame at its timestamp, using owned plane memory
-        if (!videoQueue.empty() &&
-            videoQueue.front().time <= playbackTime) {
+        if (!videoQueue.empty() && videoQueue.front().time <= playbackTime) {
             DecodedVideoFrame &frame = videoQueue.front();
 
             if (!window) {
+                // By default, SDL bypasses the compositor on X11. We don't want that so we set the hint to 0.
+                SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
                 window = SDL_CreateWindow("libsimplewebm player", frame.width, frame.height, SDL_WINDOW_RESIZABLE);
 
                 if (window)
