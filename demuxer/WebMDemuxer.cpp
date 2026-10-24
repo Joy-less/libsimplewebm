@@ -64,6 +64,7 @@ class WebMDemuxer::ParserCallback : public webm::Callback
 {
 public:
 	std::vector<ParsedFrame> *frames;
+	std::vector<size_t> *videoKeyframeIndices;
 
 	// Zero-based indexes into the video/audio track lists.
 	int requestedVideoTrack;
@@ -106,6 +107,7 @@ public:
 
 	ParserCallback() :
 		frames(NULL),
+		videoKeyframeIndices(NULL),
 		requestedVideoTrack(0),
 		requestedAudioTrack(0),
 		videoTrack(0),
@@ -135,6 +137,11 @@ public:
 	void setFrames(std::vector<ParsedFrame> *p_frames)
 	{
 		frames = p_frames;
+	}
+
+	void setVideoKeyframeIndices(std::vector<size_t> *p_videoKeyframeIndices)
+	{
+		videoKeyframeIndices = p_videoKeyframeIndices;
 	}
 
 	virtual webm::Status OnInfo(const webm::ElementMetadata &metadata, const webm::Info &info) override
@@ -279,6 +286,10 @@ public:
 		frame.buffer.resize(static_cast<size_t>(totalBytesRead));
 
 		frames->push_back(std::move(frame));
+		if (frame.video && frame.key)
+		{
+			videoKeyframeIndices->push_back(frames->size() - 1);
+		}
 
 		currentFrameIndex = frames->size() - 1;
 		currentFrameIsVideo = isVideo;
@@ -457,6 +468,7 @@ WebMDemuxer::WebMDemuxer(webm::Reader *reader, int videoTrack, int audioTrack) :
 	m_parseError(false)
 {
 	m_callback->setFrames(&m_frames);
+	m_callback->setVideoKeyframeIndices(&m_videoKeyframeIndices);
 
 	m_callback->requestedVideoTrack = videoTrack;
 	m_callback->requestedAudioTrack = audioTrack;
@@ -507,59 +519,78 @@ double WebMDemuxer::seek(double time)
         return -1.0;
     }
 
-	// Find the first frame which is >= the requested time.
 	// Note: We can assume that the frames will be in order (https://www.webmproject.org/docs/container/#muxer-guidelines).
-	size_t low = 0;
-	size_t highExclusive = m_frames.size();
-
-	while (low < highExclusive)
-	{
-		size_t mid = low + ((highExclusive - low) / 2);
-
-		if (m_frames[mid].time < time)
-		{
-			low = mid + 1;
-		}
-		else
-		{
-			highExclusive = mid;
-		}
-	}
-
-	size_t targetIndex = low;
-	if (targetIndex >= m_frames.size())
-	{
-		// Every frame is < the seek time, so start at the last frame.
-		targetIndex = m_frames.size() - 1;
-	}
+	size_t targetIndex;
 
 	if (m_vCodec != NO_VIDEO)
 	{
-		// For video files, move backward until we reach a video keyframe.
-		// Otherwise, the video frames in the keyframe will fail to decode.
-		for (size_t i = targetIndex + 1; i < m_frames.size(); i++)
+		// For video files, find the first video keyframe which is > the requested time, then select the previous video keyframe.
+		size_t low = 0;
+		size_t highExclusive = m_videoKeyframeIndices.size();
+
+		while (low < highExclusive)
 		{
-			if (m_frames[targetIndex].time == m_frames[i].time)
+			size_t mid = low + ((highExclusive - low) / 2);
+
+			const ParsedFrame &frame = m_frames[m_videoKeyframeIndices[mid]];
+
+			if (frame.time <= time)
 			{
-				targetIndex = i;
+				low = mid + 1;
+			}
+			else
+			{
+				highExclusive = mid;
 			}
 		}
-		while (true)
+
+		if (low >= 1)
 		{
-			const ParsedFrame &frame = m_frames[targetIndex];
-
-			if (frame.video && frame.key)
+			targetIndex = m_videoKeyframeIndices[low - 1];
+		}
+		else
+		{
+			// No video keyframe is <= the seek time, so start at the first video keyframe.
+			if (!m_videoKeyframeIndices.empty())
 			{
-				break;
+				targetIndex = m_videoKeyframeIndices[0];
 			}
-
-			if (targetIndex == 0)
+			else
 			{
-				// There is no video keyframe <= the requested time.
-				return -1.0;
+				targetIndex = 0;
 			}
+		}
+	}
+	else
+	{
+		// For audio files, find the first frame which is >= the requested time.
+		size_t low = 0;
+		size_t highExclusive = m_frames.size();
 
-			targetIndex--;
+		while (low < highExclusive)
+		{
+			size_t mid = low + ((highExclusive - low) / 2);
+
+			const ParsedFrame &frame = m_frames[mid];
+
+			if (frame.time < time)
+			{
+				low = mid + 1;
+			}
+			else
+			{
+				highExclusive = mid;
+			}
+		}
+
+		if (low < m_frames.size())
+		{
+			targetIndex = low;
+		}
+		else
+		{
+			// Every frame is < the seek time, so start at the last frame.
+			targetIndex = m_frames.size() - 1;
 		}
 	}
 
