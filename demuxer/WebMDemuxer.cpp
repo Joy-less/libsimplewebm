@@ -507,69 +507,61 @@ double WebMDemuxer::seek(double time)
         return -1.0;
     }
 
-    size_t targetIndex = SIZE_MAX;
+	// Find the first frame which is >= the requested time.
+	// Note: We can assume that the frames will be in order (https://www.webmproject.org/docs/container/#muxer-guidelines).
+	size_t low = 0;
+	size_t highExclusive = m_frames.size();
 
-    if (m_vCodec != NO_VIDEO)
-    {
-        // Find the video keyframe with the greatest timestamp that does not exceed the requested time.
-        double targetTime = -1.0;
+	while (low < highExclusive)
+	{
+		size_t mid = low + ((highExclusive - low) / 2);
 
-        for (size_t i = 0; i < m_frames.size(); ++i)
-        {
-            const ParsedFrame &frame = m_frames[i];
+		if (m_frames[mid].time < time)
+		{
+			low = mid + 1;
+		}
+		else
+		{
+			highExclusive = mid;
+		}
+	}
 
-            if (!frame.video || !frame.key || frame.time > time)
-            {
-                continue;
-            }
+	size_t targetIndex = low;
+	if (targetIndex >= m_frames.size())
+	{
+		// Every frame is < the seek time, so start at the last frame.
+		targetIndex = m_frames.size() - 1;
+	}
 
-            if (targetIndex == SIZE_MAX || frame.time >= targetTime)
-            {
-                targetIndex = i;
-                targetTime = frame.time;
-            }
-        }
+	if (m_vCodec != NO_VIDEO)
+	{
+		// For video files, move backward until we reach a video keyframe.
+		// Otherwise, the video frames in the keyframe will fail to decode.
+		for (size_t i = targetIndex + 1; i < m_frames.size(); i++)
+		{
+			if (m_frames[targetIndex].time == m_frames[i].time)
+			{
+				targetIndex = i;
+			}
+		}
+		while (true)
+		{
+			const ParsedFrame &frame = m_frames[targetIndex];
 
-        // If no keyframe exists at or before the requested time, use the first available video keyframe.
-        if (targetIndex == SIZE_MAX)
-        {
-            for (size_t i = 0; i < m_frames.size(); ++i)
-            {
-                if (m_frames[i].video && m_frames[i].key)
-                {
-                    targetIndex = i;
-                    break;
-                }
-            }
-        }
-    }
-    else
-    {
-        // For audio only files, we find the packet closest to the requested
-        // time without selecting a packet earlier than the request.
-        double targetTime = 0.0;
+			if (frame.video && frame.key)
+			{
+				break;
+			}
 
-        for (size_t i = 0; i < m_frames.size(); ++i)
-        {
-            const ParsedFrame &frame = m_frames[i];
+			if (targetIndex == 0)
+			{
+				// There is no video keyframe <= the requested time.
+				return -1.0;
+			}
 
-            if (frame.video || frame.time < time)
-            {
-                continue;
-            }
-
-            if (targetIndex == SIZE_MAX || frame.time < targetTime)
-            {
-                targetIndex = i;
-                targetTime = frame.time;
-            }
-        }
-    }
-
-    if (targetIndex == SIZE_MAX)
-    {
-        return -1.0;
-    }
+			targetIndex--;
+		}
+	}
 
     m_frameIndex = targetIndex;
     m_eos = false;
